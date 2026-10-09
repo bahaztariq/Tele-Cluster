@@ -1,0 +1,6 @@
+services:
+  streamlit:
+    build: .
+    container_name: tele-cluster
+    ports:
+      - "8501:8501"
