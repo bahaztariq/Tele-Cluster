@@ -1,0 +1,17 @@
+{
+  "model": "RandomForest",
+  "imbalance": "class_weight",
+  "feature_set": "raw",
+  "best_params": {
+    "model__max_depth": 19,
+    "model__max_features": 0.2752867891211309,
+    "model__min_samples_leaf": 16,
+    "model__n_estimators": 370
+  },
+  "test_metrics": {
+    "test_precision": 0.5253,
+    "test_recall": 0.7823,
+    "test_f1": 0.6285,
+    "test_roc_auc": 0.8423
+  }
+}

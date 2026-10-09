@@ -1,0 +1,20 @@
+{
+  "n_clusters": 3,
+  "profiles": {
+    "0": {
+      "name": "Low risk - No internet, Two year",
+      "size": 1513,
+      "churn_rate": 0.072
+    },
+    "1": {
+      "name": "Medium risk - Fiber optic, Two year",
+      "size": 2435,
+      "churn_rate": 0.136
+    },
+    "2": {
+      "name": "High risk - Fiber optic, Month-to-month",
+      "size": 3073,
+      "churn_rate": 0.461
+    }
+  }
+}
