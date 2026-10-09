@@ -4,3 +4,20 @@ services:
     container_name: tele-cluster
     ports:
       - "8501:8501"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.16.1
+    container_name: tele-cluster-mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow.db:/mlflow/mlflow.db
+      # Runs store absolute artifact paths (file://<project>/mlruns/...), so the
+      # folder is mounted at the same path inside the container. Run compose from
+      # the project root so ${PWD} matches.
+      - ./mlruns:${PWD}/mlruns
