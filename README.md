@@ -112,10 +112,13 @@ streamlit run app/streamlit_app.py      # http://localhost:8501
 mlflow ui --backend-store-uri sqlite:///mlflow.db   # http://localhost:5000
 ```
 
-**Docker:** the image includes the trained models from `models/`:
+**Docker:** one command starts the Streamlit app (with the trained models from `models/`)
+and the MLflow UI (official `ghcr.io/mlflow/mlflow` image, reading `mlflow.db` and
+`mlruns/`). Run it from the project root:
 
 ```bash
-docker compose up --build               # http://localhost:8501
+docker compose up --build    # Streamlit http://localhost:8501, MLflow http://localhost:5000
+docker compose down          # stop both
 ```
 
 ## Methodology
@@ -196,6 +199,48 @@ customer features, and *k* is picked automatically by Silhouette, which gives **
 | Low risk - No internet, Two year | 1513 | 7% |
 | Medium risk - Fiber optic, Two year | 2435 | 14% |
 | High risk - Fiber optic, Month-to-month | 3073 | 46% |
+
+K-Means beats Agglomerative and DBSCAN on Silhouette (0.227 vs 0.207 / 0.217) and
+Calinski-Harabasz. Churn was not used to build the segments; it is only used here to
+describe them.
+
+**Segment interpretation**
+
+- **Low risk: phone-only customers** (22%). None have internet, so they average 1.2
+  services and pay about 21/month. Two-thirds are on a one- or two-year contract, and few
+  pay by electronic check (8%). They are cheap to serve and rarely leave (7% churn).
+  *Action:* keep them stable, and offer internet bundles carefully, since adding services
+  is what makes the other segments more expensive and more volatile.
+- **Medium risk: loyal, fully-equipped customers** (35%). They have been customers for
+  about 4.5 years and have the most services (6.5 on average, 60% with tech support or
+  online security, 71% streaming). They also pay the most (about 87/month) and are mostly
+  on one- or two-year contracts with automatic payment (65%) and families (74%). Churn is
+  low (14%), and most of it comes from the fiber customers in this group (20% vs 5% on DSL).
+  *Action:* these are the most valuable customers. Retain them with loyalty rewards and
+  contract renewals, and keep an eye on fiber service quality.
+- **High risk: new month-to-month customers** (44%). 93% are month-to-month and 54%
+  joined in the last 12 months (average tenure about 16 months). Few have tech support or
+  security (about 20%), and over half pay by electronic check. Their bill is high for the
+  few services they use (about 69/month for 3.7 services). Nearly half leave (46%), rising
+  to 58% for those on fiber.
+  *Action:* this is the priority retention target. Offer discounts for moving to a 1- or
+  2-year contract, switch them to automatic payment, bundle tech support and security
+  during onboarding, and review fiber pricing.
+
+Each model's best configuration (chosen by cross-validated F1) evaluated on the held-out
+test set. Confusion matrices and ROC curves are in
+`reports/classification/test_comparison.png`:
+
+| Model | Imbalance | Features | Precision | Recall | F1 | ROC-AUC |
+| --- | --- | --- | --- | --- | --- | --- |
+| Random Forest | class_weight | raw | 0.540 | 0.745 | **0.626** | 0.839 |
+| Logistic Regression | smote | raw + cluster | 0.513 | 0.758 | 0.612 | **0.840** |
+| XGBoost | class_weight | raw + cluster | 0.519 | 0.755 | 0.615 | 0.836 |
+| SVM | class_weight | raw + FE + cluster | 0.611 | 0.616 | 0.613 | 0.827 |
+| Decision Tree | class_weight | raw + FE + cluster | 0.496 | **0.788** | 0.609 | 0.827 |
+
+SVM's test recall is lower than its CV recall (0.79) because the test metrics use
+`predict_proba >= 0.5`, and SVM's probability calibration partly undoes the class weighting.
 
 The conclusions match the notebooks:
 - Rebalancing matters more than the choice of model.
