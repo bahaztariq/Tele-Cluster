@@ -13,5 +13,10 @@
     "test_recall": 0.7823,
     "test_f1": 0.6285,
     "test_roc_auc": 0.8423
+  },
+  "mlflow_run_id": "ec315831ff2c4b68ba159830d2c3a6dd",
+  "registered_model": {
+    "name": "tele-cluster-churn-app",
+    "version": 1
   }
 }

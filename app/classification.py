@@ -1,4 +1,13 @@
+"""Churn classification, in four steps (all model selection is cross-validated on the train set):
+
+1. every model with every imbalance strategy;
+2. each model's best strategy on four feature sets (raw / + cluster / + FE / + FE + cluster);
+3. hyperparameter search on each model's best configuration, before vs after;
+4. the tuned models on the test set; the best one is registered in MLflow and saved for the app.
+"""
+
 import json
+from dataclasses import dataclass
 
 import matplotlib
 
@@ -9,7 +18,7 @@ import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
 import pandas as pd
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.pipeline import Pipeline
 from scipy.stats import loguniform, randint, uniform
 from sklearn.base import clone
@@ -24,7 +33,13 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import (
+    GridSearchCV,
+    RandomizedSearchCV,
+    StratifiedKFold,
+    cross_validate,
+    train_test_split,
+)
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
@@ -34,6 +49,8 @@ from app.extractor import DataExtractor
 from app.transformer import DataTransformer
 
 OUTPUT_DIR = REPORTS_DIR / "classification"
+REGISTERED_MODEL = "tele-cluster-churn-app"
+METRICS = ["precision", "recall", "f1", "roc_auc"]
 
 MODELS = {
     "LogisticRegression": LogisticRegression(max_iter=2000),
@@ -43,206 +60,235 @@ MODELS = {
     "XGBoost": XGBClassifier(n_estimators=300, max_depth=4, learning_rate=0.05, n_jobs=1, random_state=RANDOM_STATE),
 }
 
-STRATEGIES = ["none", "class_weight", "smote"]
+STRATEGIES = ["none", "class_weight", "random_oversampling", "smote"]
+SAMPLERS = {"random_oversampling": RandomOverSampler, "smote": SMOTE}
 
+# label -> (feature engineering, cluster feature)
+FEATURE_SETS = {"raw": (False, False), "raw+cluster": (False, True),
+                "raw+FE": (True, False), "raw+FE+cluster": (True, True)}
+
+# GridSearchCV for small search spaces, RandomizedSearchCV (N_ITER samples) for large ones.
+N_ITER = 20
 SEARCH_SPACES = {
-    "LogisticRegression": {"model__C": loguniform(1e-3, 1e2)},
-    "DecisionTree": {"model__max_depth": randint(3, 15), "model__min_samples_leaf": randint(1, 60)},
-    "RandomForest": {"model__n_estimators": randint(100, 500), "model__max_depth": randint(4, 20),
-                     "model__min_samples_leaf": randint(1, 30), "model__max_features": uniform(0.1, 0.6)},
-    "SVM": {"model__C": loguniform(1e-2, 1e2), "model__gamma": loguniform(1e-4, 1e-1)},
-    "XGBoost": {"model__n_estimators": randint(100, 600), "model__max_depth": randint(2, 8),
-                "model__learning_rate": loguniform(0.01, 0.3), "model__subsample": uniform(0.6, 0.4)},
+    "LogisticRegression": ("grid", {"model__C": [0.01, 0.03, 0.1, 0.3, 1, 3, 10]}),
+    "DecisionTree": ("grid", {"model__max_depth": [3, 4, 5, 6, 8, 10], "model__min_samples_leaf": [1, 10, 20, 50]}),
+    "SVM": ("grid", {"model__C": [0.1, 1, 10], "model__gamma": ["scale", 0.01, 0.03]}),
+    "RandomForest": ("random", {"model__n_estimators": randint(100, 500), "model__max_depth": randint(4, 20),
+                                "model__min_samples_leaf": randint(1, 30), "model__max_features": uniform(0.1, 0.6)}),
+    "XGBoost": ("random", {"model__n_estimators": randint(100, 600), "model__max_depth": randint(2, 8),
+                           "model__learning_rate": loguniform(0.01, 0.3), "model__subsample": uniform(0.6, 0.4)}),
 }
 
-METRICS = ["precision", "recall", "f1", "roc_auc"]
+# Fixed preprocessing choices, logged with every run next to DataTransformer's own parameters.
+PREP_PARAMS = {"prep__imputer": "median / 'Missing'", "prep__outliers": "IQR clip",
+               "prep__scaler": "StandardScaler", "prep__encoder": "OneHotEncoder"}
 
 
-def build_pipeline(name, strategy, pos_weight, feature_engineering=True, n_clusters=None) -> Pipeline:
-    model = clone(MODELS[name])
-    if strategy == "class_weight":
-        # XGBoost has no class_weight; scale_pos_weight is its equivalent.
-        model.set_params(**({"scale_pos_weight": pos_weight} if name == "XGBoost" else {"class_weight": "balanced"}))
-    steps = [("prep", DataTransformer(feature_engineering=feature_engineering, n_clusters=n_clusters))]
-    if strategy == "smote":
-        # imblearn runs samplers during fit only, so SMOTE never sees validation or test rows.
-        steps.append(("smote", SMOTE(random_state=RANDOM_STATE)))
-    steps.append(("model", model))
-    return Pipeline(steps)
+@dataclass
+class Data:
+    X_train: pd.DataFrame
+    X_test: pd.DataFrame
+    y_train: pd.Series
+    y_test: pd.Series
+    pos_weight: float  # negatives / positives, XGBoost's equivalent of class_weight="balanced"
+    n_clusters: int  # number of segments found by the clustering step
 
 
-def cross_validated(pipeline, X, y) -> dict:
-    cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    result = cross_validate(pipeline, X, y, cv=cv, scoring=METRICS, n_jobs=N_JOBS)
-    return {f"cv_{m}": result[f"test_{m}"].mean() for m in METRICS}
-
-
-def test_metrics(pipeline, X_test, y_test) -> dict:
-    proba = pipeline.predict_proba(X_test)[:, 1]
-    pred = (proba >= 0.5).astype(int)
-    return {
-        "test_precision": precision_score(y_test, pred),
-        "test_recall": recall_score(y_test, pred),
-        "test_f1": f1_score(y_test, pred),
-        "test_roc_auc": roc_auc_score(y_test, proba),
-    }
-
-
-def log_run(run_name, pipeline, metrics, params, example, figures=None):
-    """Log one experiment; `pipeline` must already be fitted on the training set."""
-    with mlflow.start_run(run_name=run_name):
-        prep = pipeline.named_steps["prep"]
-        model = pipeline.named_steps["model"]
-        hyper = {k: v for k, v in model.get_params().items() if isinstance(v, (str, int, float, bool))}
-        mlflow.log_params({f"model__{k}": v for k, v in hyper.items()})
-        mlflow.log_params({
-            "model": type(model).__name__,
-            "prep__feature_engineering": prep.feature_engineering,
-            "prep__cluster_feature": bool(prep.n_clusters),
-            "prep__iqr_factor": prep.iqr_factor,
-            "prep__imputer": "median / 'Missing'",
-            "prep__scaler": "StandardScaler",
-            "prep__encoder": "OneHotEncoder",
-            **params,
-        })
-        mlflow.log_metrics({k: float(v) for k, v in metrics.items()})
-        for name, fig in (figures or {}).items():
-            mlflow.log_figure(fig, f"{name}.png")
-        mlflow.sklearn.log_model(pipeline, name="model", serialization_format="cloudpickle", input_example=example)
-
-
-def evaluation_figures(pipeline, X_test, y_test, title) -> dict:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    ConfusionMatrixDisplay.from_estimator(pipeline, X_test, y_test, display_labels=["Stay", "Churn"], ax=axes[0])
-    RocCurveDisplay.from_estimator(pipeline, X_test, y_test, ax=axes[1])
-    axes[0].set_title("Confusion matrix (test)")
-    axes[1].set_title("ROC curve (test)")
-    fig.suptitle(title)
-    fig.tight_layout()
-    return {"evaluation": fig}
-
-
-def compare_on_test(pipelines: dict, X_test, y_test) -> tuple[pd.DataFrame, plt.Figure]:
-    """Test metrics, confusion matrix and ROC curve for each model."""
-    fig, axes = plt.subplots(1, len(pipelines) + 1, figsize=(4.5 * (len(pipelines) + 1), 4.5))
-    rows = []
-    for ax, (name, pipeline) in zip(axes, pipelines.items()):
-        ConfusionMatrixDisplay.from_estimator(
-            pipeline, X_test, y_test, display_labels=["Stay", "Churn"], ax=ax, colorbar=False
-        )
-        ax.set_title(name)
-        RocCurveDisplay.from_estimator(pipeline, X_test, y_test, name=name, ax=axes[-1])
-        rows.append({"model": name, **test_metrics(pipeline, X_test, y_test)})
-    axes[-1].set_title("ROC curves")
-    fig.suptitle("Test set: confusion matrices and ROC curves (best configuration per model)")
-    fig.tight_layout()
-    return pd.DataFrame(rows).set_index("model"), fig
-
-
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def load_data() -> Data:
     extractor = DataExtractor()
     extractor.load()
     X, y = extractor.features_and_target()
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
-    pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    n_clusters = json.loads((MODELS_DIR / "segmentation.json").read_text())["n_clusters"]
-    example = X_train.head(3)
-    setup_mlflow("tele-cluster-churn")
-
-    # 1. Five models x three imbalance strategies (cross-validated on the training set only).
-    print(f"== Models x imbalance strategies ({CV_FOLDS}-fold CV, train set) ==")
-    rows = []
-    for name in MODELS:
-        for strategy in STRATEGIES:
-            pipeline = build_pipeline(name, strategy, pos_weight)
-            metrics = cross_validated(pipeline, X_train, y_train)
-            pipeline.fit(X_train, y_train)
-            log_run(f"{name}_{strategy}", pipeline, metrics, {"imbalance": strategy, "stage": "comparison"}, example)
-            rows.append({"model": name, "imbalance": strategy, **metrics})
-            print(f"{name:20s} {strategy:13s} " + "  ".join(f"{k}={v:.3f}" for k, v in metrics.items()))
-    comparison = pd.DataFrame(rows).sort_values("cv_f1", ascending=False)
-    comparison.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False)
-
-    # 2. Value of feature engineering and of the cluster feature, per model (best strategy each).
-    print("\n== Feature sets: raw / raw + cluster / raw + FE / raw + FE + cluster ==")
-    best_strategy = comparison.drop_duplicates("model").set_index("model")["imbalance"]
-    feature_sets = {"raw": (False, None), "raw+cluster": (False, n_clusters),
-                    "raw+FE": (True, None), "raw+FE+cluster": (True, n_clusters)}
-    rows, fitted = [], {}
-    for name, strategy in best_strategy.items():
-        for label, (fe, k) in feature_sets.items():
-            pipeline = build_pipeline(name, strategy, pos_weight, feature_engineering=fe, n_clusters=k)
-            metrics = cross_validated(pipeline, X_train, y_train)
-            fitted[name, label] = pipeline.fit(X_train, y_train)
-            log_run(f"{name}_{label}", pipeline, metrics,
-                    {"imbalance": strategy, "feature_set": label, "stage": "feature_sets"}, example)
-            rows.append({"model": name, "imbalance": strategy, "feature_set": label, **metrics})
-    features = pd.DataFrame(rows)
-    features.to_csv(OUTPUT_DIR / "feature_set_comparison.csv", index=False)
-    print(features.pivot(index="model", columns="feature_set", values="cv_f1").round(4).to_string())
-    print(features.groupby("feature_set")[["cv_f1", "cv_roc_auc"]].mean().round(4).to_string())
-
-    # 3. Each model's best configuration on the held-out test set.
-    print("\n== Test set: best configuration per model ==")
-    best_rows = features.sort_values("cv_f1", ascending=False).drop_duplicates("model")
-    test_results, test_fig = compare_on_test(
-        {r.model: fitted[r.model, r.feature_set] for r in best_rows.itertuples()}, X_test, y_test
+    return Data(
+        X_train, X_test, y_train, y_test,
+        pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
+        n_clusters=json.loads((MODELS_DIR / "segmentation.json").read_text())["n_clusters"],
     )
-    test_results.insert(0, "feature_set", best_rows.set_index("model")["feature_set"])
-    test_results.insert(0, "imbalance", best_rows.set_index("model")["imbalance"])
-    print(test_results.round(4).to_string())
-    test_results.to_csv(OUTPUT_DIR / "test_comparison.csv")
-    test_fig.savefig(OUTPUT_DIR / "test_comparison.png", dpi=110)
-    with mlflow.start_run(run_name="test_comparison"):
-        mlflow.log_param("stage", "test_comparison")
-        mlflow.log_metrics({f"{model}_{k}": float(v) for model, row in test_results.iterrows()
-                            for k, v in row.items() if k.startswith("test_")})
-        mlflow.log_figure(test_fig, "test_comparison.png")
-        mlflow.log_text(test_results.round(4).to_csv(), "test_comparison.csv")
 
-    # 4. Hyperparameter search on the best configuration.
-    best = features.sort_values("cv_f1", ascending=False).iloc[0]
-    fe, k = feature_sets[best["feature_set"]]
-    baseline = build_pipeline(best["model"], best["imbalance"], pos_weight, fe, k)
-    print(f"\n== RandomizedSearchCV on {best['model']} / {best['imbalance']} / {best['feature_set']} ==")
-    search = RandomizedSearchCV(
-        baseline, SEARCH_SPACES[best["model"]], n_iter=20, scoring="f1", n_jobs=N_JOBS, random_state=RANDOM_STATE,
-        cv=StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
-    ).fit(X_train, y_train)
-    tuned = search.best_estimator_
-    print("Best params:", search.best_params_)
 
-    # 5. Before vs after optimisation, on CV and on the held-out test set.
-    baseline.fit(X_train, y_train)
-    before = {**cross_validated(baseline, X_train, y_train), **test_metrics(baseline, X_test, y_test)}
-    after = {**cross_validated(tuned, X_train, y_train), **test_metrics(tuned, X_test, y_test)}
-    optimisation = pd.DataFrame({"before": before, "after": after})
+def build_pipeline(data, model, imbalance, feature_set) -> Pipeline:
+    estimator = clone(MODELS[model])
+    if imbalance == "class_weight":
+        estimator.set_params(
+            **({"scale_pos_weight": data.pos_weight} if model == "XGBoost" else {"class_weight": "balanced"})
+        )
+    feature_engineering, cluster = FEATURE_SETS[feature_set]
+    steps = [("prep", DataTransformer(feature_engineering, n_clusters=data.n_clusters if cluster else None))]
+    if imbalance in SAMPLERS:
+        # imblearn runs samplers during fit only, so they never see validation or test rows.
+        steps.append(("sampler", SAMPLERS[imbalance](random_state=RANDOM_STATE)))
+    steps.append(("model", estimator))
+    return Pipeline(steps)
+
+
+def folds():
+    return StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+
+def test_metrics(pipeline, data) -> dict:
+    proba = pipeline.predict_proba(data.X_test)[:, 1]
+    pred = (proba >= 0.5).astype(int)
+    return {
+        "test_precision": precision_score(data.y_test, pred),
+        "test_recall": recall_score(data.y_test, pred),
+        "test_f1": f1_score(data.y_test, pred),
+        "test_roc_auc": roc_auc_score(data.y_test, proba),
+    }
+
+
+def log_run(run_name, pipeline, metrics, params, data) -> str:
+    """Log a fitted pipeline to MLflow: hyperparameters, preprocessing, metrics and the model."""
+    hyper = {f"model__{k}": v for k, v in pipeline.named_steps["model"].get_params().items()
+             if isinstance(v, (str, int, float, bool))}
+    prep = {f"prep__{k}": v for k, v in pipeline.named_steps["prep"].get_params().items()}
+    with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_params({**hyper, **prep, **PREP_PARAMS, **params})
+        mlflow.log_metrics(metrics)
+        mlflow.sklearn.log_model(pipeline, name="model", serialization_format="cloudpickle",
+                                 input_example=data.X_train.head(3))
+    return run.info.run_id
+
+
+def run_config(data, model, imbalance, feature_set, stage) -> tuple[dict, Pipeline]:
+    """Cross-validate one configuration, fit it on the train set and log it."""
+    pipeline = build_pipeline(data, model, imbalance, feature_set)
+    result = cross_validate(pipeline, data.X_train, data.y_train, cv=folds(), scoring=METRICS, n_jobs=N_JOBS)
+    metrics = {f"cv_{m}": result[f"test_{m}"].mean() for m in METRICS}
+    pipeline.fit(data.X_train, data.y_train)
+    config = {"model": model, "imbalance": imbalance, "feature_set": feature_set}
+    log_run(f"{model}_{imbalance}_{feature_set}", pipeline, metrics, {**config, "stage": stage}, data)
+    print(f"{model:20s} {imbalance:20s} {feature_set:15s} " + "  ".join(f"{k}={v:.3f}" for k, v in metrics.items()))
+    return {**config, **metrics}, pipeline
+
+
+def best_per_model(table) -> pd.DataFrame:
+    return table.sort_values("cv_f1", ascending=False).drop_duplicates("model")
+
+
+def compare_strategies(data) -> pd.DataFrame:
+    print(f"== 1. Models x imbalance strategies ({CV_FOLDS}-fold CV) ==")
+    rows = [run_config(data, model, imbalance, "raw+FE", "imbalance")[0]
+            for model in MODELS for imbalance in STRATEGIES]
+    table = pd.DataFrame(rows).sort_values("cv_f1", ascending=False)
+    table.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False)
+    return table
+
+
+def compare_feature_sets(data, strategies) -> tuple[pd.DataFrame, dict]:
+    print("\n== 2. Feature sets, each model with its best strategy ==")
+    rows, fitted = [], {}
+    for r in best_per_model(strategies).itertuples():
+        for feature_set in FEATURE_SETS:
+            row, fitted[r.model, feature_set] = run_config(data, r.model, r.imbalance, feature_set, "feature_sets")
+            rows.append(row)
+    table = pd.DataFrame(rows)
+    table.to_csv(OUTPUT_DIR / "feature_set_comparison.csv", index=False)
+    print(table.pivot(index="model", columns="feature_set", values="cv_f1").round(4).to_string())
+    return table, fitted
+
+
+def tune_models(data, best, fitted) -> tuple[pd.DataFrame, dict, dict]:
+    """Search each model's best configuration; return before/after metrics, the searches and their MLflow runs."""
+    print("\n== 3. Hyperparameter tuning, best configuration per model ==")
+    rows, searches, run_ids = [], {}, {}
+    for r in best.itertuples():
+        kind, space = SEARCH_SPACES[r.model]
+        pipeline = build_pipeline(data, r.model, r.imbalance, r.feature_set)
+        options = {"scoring": METRICS, "refit": "f1", "cv": folds(), "n_jobs": N_JOBS}
+        search = (GridSearchCV(pipeline, space, **options) if kind == "grid"
+                  else RandomizedSearchCV(pipeline, space, n_iter=N_ITER, random_state=RANDOM_STATE, **options))
+        searches[r.model] = search.fit(data.X_train, data.y_train)
+
+        before = {**{f"cv_{m}": getattr(r, f"cv_{m}") for m in METRICS},
+                  **test_metrics(fitted[r.model, r.feature_set], data)}
+        after = {**{f"cv_{m}": search.cv_results_[f"mean_test_{m}"][search.best_index_] for m in METRICS},
+                 **test_metrics(search.best_estimator_, data)}
+        rows += [{"model": r.model, "stage": "before", **before}, {"model": r.model, "stage": "after", **after}]
+
+        params = {"model": r.model, "imbalance": r.imbalance, "feature_set": r.feature_set,
+                  "search": kind, "stage": "tuned"}
+        run_ids[r.model] = log_run(f"{r.model}_tuned", search.best_estimator_, after, params, data)
+        print(f"{r.model:20s} {kind:6s} cv_f1 {before['cv_f1']:.3f} -> {after['cv_f1']:.3f}  {search.best_params_}")
+
+    optimisation = pd.DataFrame(rows).set_index(["model", "stage"])
     optimisation.to_csv(OUTPUT_DIR / "optimisation.csv")
-    print(optimisation.round(4).to_string())
+    return optimisation, searches, run_ids
 
-    title = f"{best['model']} ({best['imbalance']}, {best['feature_set']}) - tuned"
-    figures = evaluation_figures(tuned, X_test, y_test, title)
-    figures["evaluation"].savefig(OUTPUT_DIR / "final_evaluation.png", dpi=110)
-    report = classification_report(y_test, tuned.predict(X_test), target_names=["Stay", "Churn"])
-    print("\n" + report)
+
+def tuning_figure(optimisation) -> plt.Figure:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+    for ax, metric in zip(axes, ["cv_f1", "test_f1"]):
+        optimisation[metric].unstack("stage")[["before", "after"]].plot.bar(ax=ax, rot=15)
+        ax.set(title=f"{metric}: before vs after tuning", xlabel="", ylim=(0.4, 0.7))
+    fig.tight_layout()
+    return fig
+
+
+def test_figure(pipelines, data) -> plt.Figure:
+    """One confusion matrix per model, plus all ROC curves on the last panel."""
+    fig, axes = plt.subplots(1, len(pipelines) + 1, figsize=(4.5 * (len(pipelines) + 1), 4.5))
+    for ax, (name, pipeline) in zip(axes, pipelines.items()):
+        ConfusionMatrixDisplay.from_estimator(pipeline, data.X_test, data.y_test, display_labels=["Stay", "Churn"],
+                                              ax=ax, colorbar=False)
+        ax.set_title(name)
+        RocCurveDisplay.from_estimator(pipeline, data.X_test, data.y_test, name=name, ax=axes[-1])
+    axes[-1].set_title("ROC curves")
+    fig.suptitle("Test set: tuned models (best configuration per model)")
+    fig.tight_layout()
+    return fig
+
+
+def save_final(data, best, optimisation, searches, run_ids):
+    """Compare the tuned models on the test set; log, register and save the one with the best CV F1."""
+    print("\n== 4. Tuned models on the test set ==")
+    summary = (best.set_index("model")[["imbalance", "feature_set"]]
+               .join(optimisation.xs("after", level="stage"))
+               .sort_values("cv_f1", ascending=False))
+    summary.to_csv(OUTPUT_DIR / "test_comparison.csv")
+    print(summary.round(4).to_string())
+
+    name = summary.index[0]
+    final = searches[name].best_estimator_
+    report = classification_report(data.y_test, final.predict(data.X_test), target_names=["Stay", "Churn"])
+    print(f"\nFinal model: {name}\n{report}")
     (OUTPUT_DIR / "classification_report.txt").write_text(report)
 
-    params = {"imbalance": best["imbalance"], "feature_set": best["feature_set"], "stage": "final"}
-    log_run(f"{best['model']}_baseline", baseline, before, {**params, "stage": "before_tuning"}, example)
-    log_run(f"{best['model']}_tuned", tuned, after, params, example, figures)
+    figures = {"test_comparison": test_figure({m: s.best_estimator_ for m, s in searches.items()}, data),
+               "optimisation": tuning_figure(optimisation)}
+    with mlflow.start_run(run_id=run_ids[name]):
+        mlflow.set_tag("final", "true")
+        mlflow.log_text(report, "classification_report.txt")
+        for fig_name, fig in figures.items():
+            fig.savefig(OUTPUT_DIR / f"{fig_name}.png", dpi=110)
+            mlflow.log_figure(fig, f"{fig_name}.png")
+    version = mlflow.register_model(f"runs:/{run_ids[name]}/model", REGISTERED_MODEL).version
+    print(f"Registered {REGISTERED_MODEL} version {version}")
 
-    joblib.dump(tuned, MODELS_DIR / "churn.joblib")
+    joblib.dump(final, MODELS_DIR / "churn.joblib")
     (MODELS_DIR / "churn.json").write_text(json.dumps({
-        "model": best["model"],
-        "imbalance": best["imbalance"],
-        "feature_set": best["feature_set"],
-        "best_params": {k: getattr(v, "item", lambda: v)() for k, v in search.best_params_.items()},
-        "test_metrics": {k: round(float(v), 4) for k, v in after.items() if k.startswith("test_")},
-    }, indent=2))
+        "model": name,
+        "imbalance": summary.loc[name, "imbalance"],
+        "feature_set": summary.loc[name, "feature_set"],
+        "best_params": searches[name].best_params_,
+        "test_metrics": summary.loc[name].filter(like="test_").astype(float).round(4).to_dict(),
+        "mlflow_run_id": run_ids[name],
+        "registered_model": {"name": REGISTERED_MODEL, "version": int(version)},
+    }, indent=2, default=lambda v: v.item()))  # numpy numbers from the search spaces
     print("Saved models/churn.joblib")
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    setup_mlflow("tele-cluster-churn")
+    data = load_data()
+
+    strategies = compare_strategies(data)
+    feature_sets, fitted = compare_feature_sets(data, strategies)
+    best = best_per_model(feature_sets)
+    optimisation, searches, run_ids = tune_models(data, best, fitted)
+    save_final(data, best, optimisation, searches, run_ids)
 
 
 if __name__ == "__main__":
