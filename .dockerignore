@@ -6,6 +6,5 @@ __pycache__/
 mlruns/
 mlflow.db
 reports/
-notebooks/
 archive/
 data/processed/
