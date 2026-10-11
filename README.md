@@ -8,11 +8,6 @@ subscription (classification). It then checks whether the profiles help the pred
 tunes the models, tracks every experiment in MLflow, and serves the result in a Streamlit
 app packaged with Docker.
 
-The project is implemented twice, with two different approaches:
-
-- **`notebooks/`**: the step-by-step analysis, with explanations, figures and conclusions.
-- **`app/`**: the same steps as plain Python scripts, plus the Streamlit app and Docker image.
-
 ## Project goals
 
 1. **Data analysis and preparation**: EDA, missing values, duplicates, outliers,
@@ -28,7 +23,7 @@ The project is implemented twice, with two different approaches:
 5. **Optimization**: cross-validation, `GridSearchCV` / `RandomizedSearchCV`, before vs
    after, contribution of feature engineering and of the cluster.
 6. **MLflow**: hyperparameters, metrics, model, preprocessing parameters and artifacts for
-   every experiment.
+   every experiment, and the final model in the Model Registry.
 7. **Deployment**: Streamlit interface (cluster, churn prediction, churn probability),
    containerized with Docker.
 
@@ -52,32 +47,26 @@ columns do not exist in this dataset, so they are not modelled.
 ## Repository layout
 
 ```
-notebooks/
-  01_eda_preparation.ipynb       Step 1: EDA, data quality, feature engineering, preprocessing
-  02_clustering.ipynb            Step 2: choice of k, K-Means vs Agglomerative vs DBSCAN, PCA, profiles
-  03_classification.ipynb        Step 3: 5 models x imbalance strategies, test evaluation
-  04_cluster_feature.ipynb       Step 4: initial variables vs initial variables + cluster
-  05_optimization_mlflow.ipynb   Steps 5-6: tuning, before/after, final model, MLflow
 app/
-  config.py                      Paths and constants
-  extractor.py                   DataExtractor: load the CSV, quality report
-  transformer.py                 DataTransformer: feature engineering, imputation, IQR
-                                 clipping, one-hot, scaling, optional cluster feature
-  eda.py / clustering.py /       Steps 1-6 as scripts
-  classification.py
-  main.py                        Runs eda -> clustering -> classification
-  streamlit_app.py               Step 7: Streamlit interface
-data/
-  raw/                           Source CSV
-  processed/telco_clean.csv      Cleaned dataset with engineered features (notebook 01)
+  config.py              Paths and constants
+  extractor.py           DataExtractor: load the CSV, quality report
+  transformer.py         DataTransformer: feature engineering, imputation, IQR clipping,
+                         one-hot encoding, scaling, optional cluster feature
+  eda.py                 Step 1: data quality and EDA figures
+  clustering.py          Step 2: choice of k, K-Means vs Agglomerative vs DBSCAN, PCA, profiles
+  classification.py      Steps 3-6: models x imbalance strategies, feature sets (with and
+                         without cluster), tuning, final model, MLflow
+  main.py                Runs eda -> clustering -> classification
+  streamlit_app.py       Step 7: Streamlit interface
+data/raw/                Source CSV
 models/
-  cluster_pipeline.pkl           Notebook clustering pipeline (k=4)
-  churn_model.pkl                Notebook final churn model
-  model_info.json                Notebook final model: params, test metrics, cluster names
-  segmentation.joblib / .json    App clustering pipeline and segment profiles
-  churn.joblib / .json           App final churn model and its metrics
-Dockerfile, docker-compose.yml   Streamlit image
+  segmentation.joblib / .json    Clustering pipeline and segment profiles
+  churn.joblib / .json           Final churn model, its parameters and test metrics
+Dockerfile, docker-compose.yml   Streamlit app + MLflow UI
 ```
+
+Generated figures and tables go to `reports/` (`eda/`, `clustering/`, `classification/`),
+and MLflow runs to `mlflow.db` and `mlruns/`. None of these are committed.
 
 ## Getting started
 
@@ -87,14 +76,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Notebooks:** run them in order (01 → 05). Each one is self-contained.
-
-```bash
-pip install jupyter
-jupyter notebook notebooks/
-```
-
-**App pipeline:** retrains the app models in `models/` (about 20 minutes):
+**Pipeline:** retrains every model in `models/` and logs all runs to MLflow (about 25-30
+minutes; the churn classification alone takes about 23, most of it in the hyperparameter
+search):
 
 ```bash
 python -m app.main
@@ -125,74 +109,43 @@ docker compose down          # stop both
 
 - **No target in the clustering.** `Churn` is never an input to the segmentation. It is
   only used afterwards, to describe the churn rate of each profile.
-- **No data leakage.** Imputation, scaling, encoding, the K-Means used for the `cluster`
-  feature, and SMOTE / oversampling all live inside one `imblearn` pipeline. They are
-  fitted on the training data only (on each training fold during cross-validation), and
-  the samplers never touch validation or test rows.
+- **No data leakage.** Imputation, outlier clipping, scaling, encoding, the K-Means used for
+  the `cluster` feature, and SMOTE / Random Oversampling all live inside one `imblearn`
+  pipeline. They are fitted on the training data only (on each training fold during
+  cross-validation), and the samplers never touch validation or test rows.
+- **Model selection uses the training set only** (5-fold stratified cross-validation, F1).
+  The 20% test set is only used to report the final scores.
 - **`customerID` is dropped.** It is a unique key with no predictive value.
 - **`TotalCharges`** is read as text because 11 rows are blank (customers with tenure 0).
   It is converted to numbers, and the blanks are imputed inside the pipeline.
 
-## Results (notebooks)
+## Results
 
 ### 1. Data analysis
 
-- 7043 customers. 22 duplicated profiles were removed, leaving 7021. 11 `TotalCharges`
-  values are missing. No abnormal outliers.
-- The target is imbalanced: about 26.5% churn.
-- Main churn drivers: short tenure, month-to-month contract, fiber optic, no online
-  security or tech support, electronic check, high monthly charges.
-- 8 features were engineered, e.g. number of services, average monthly spend, charges per
-  service, month-to-month flag, auto-payment, family, new customer, tenure group.
+- 7043 customers. 22 duplicated profiles are removed, leaving 7021. 11 `TotalCharges`
+  values are missing. No IQR outliers in `tenure`, `MonthlyCharges` or `TotalCharges`.
+- The target is imbalanced: 26.5% churn, so accuracy is not used; models are compared on
+  precision, recall, F1 and ROC-AUC.
+- Main churn drivers:
+
+  | Variable | Churn rate |
+  | --- | --- |
+  | Contract | month-to-month 43%, one year 11%, two year 3% |
+  | Internet | fiber optic 42%, DSL 19%, none 7% |
+  | Payment | electronic check 45%, other methods 15-19% |
+  | Tech support / online security | without 42%, with 15% |
+  | Senior citizen | 42% vs 24% |
+
+  Churners have shorter tenure (18 vs 38 months on average) and higher monthly charges
+  (75 vs 61).
+- 7 features are engineered: number of services, average monthly spend, charges per
+  service, month-to-month flag, automatic payment, family, tenure group.
 
 ### 2. Customer segments
 
-Elbow and Silhouette were computed for k = 2…10. Silhouette is highest at k = 2 (0.35),
-but that split only separates customers with internet from those without. **k = 4** is
-almost as good (0.32), sits at the elbow, and gives four actionable profiles. Agglomerative
-clustering confirms the result; DBSCAN is not suited to this mostly-binary data.
-
-| Profile | Description | Churn | Action |
-| --- | --- | --- | --- |
-| Basic phone-only | No internet, ~1 service, ~21/month | ~7% | Stable, low value; upsell carefully |
-| Loyal premium | ~5 years tenure, many services, ~91/month, 1-2 year contracts | ~14% | Retain and reward |
-| Mid-value DSL | DSL, ~20 months, ~52/month, mostly month-to-month | ~25% | Push longer contracts and add-ons |
-| New fiber, at risk | Fiber optic, ~15 months, ~85/month, month-to-month, manual payment | ~57% | **Priority retention target** |
-
-### 3. Classification
-
-- Without rebalancing, recall is about 0.5, so half of the churners are missed.
-- `class_weight`, oversampling and SMOTE raise recall to 0.75-0.80 and improve F1.
-- The best models reach test F1 of about 0.62-0.63 and ROC-AUC of about 0.83-0.84.
-
-### 4. Cluster as a feature
-
-| | Initial variables | Initial + cluster |
-| --- | --- | --- |
-| Best CV F1 (Logistic Regression) | 0.631 | 0.632 |
-| Best test ROC-AUC (Logistic Regression) | 0.841 | 0.841 |
-
-The cluster is informative on its own (ROC-AUC about 0.76 using only `cluster`), but it adds
-no significant gain on top of the initial variables. It summarizes information the
-classifier already has: contract, internet type, tenure and charges. **The cluster adds
-interpretability, not predictive power.**
-
-### 5-6. Optimization and final model
-
-| Step | Result |
-| --- | --- |
-| Tuning (GridSearchCV / RandomizedSearchCV, 5-fold CV, F1) | Big gain for Decision Tree, +0.02 F1 for Random Forest |
-| Feature engineering | Small positive gain |
-| Cluster variable | No significant gain |
-| **Final model** | Tuned Random Forest (`class_weight="balanced"`, raw + engineered features) |
-
-Final model on the held-out test set: **recall 0.78, precision 0.53, F1 0.63,
-ROC-AUC 0.84**. It catches about 4 out of 5 churners. All experiments are tracked in MLflow.
-
-## Results (app)
-
-The app scripts follow the same steps with a different approach. Clustering uses all
-customer features, and *k* is picked automatically by Silhouette, which gives **k = 3**:
+Clustering uses all customer features, and *k* is picked automatically by Silhouette
+(k = 2…8), which gives **k = 3**:
 
 | Segment | Customers | Churn rate |
 | --- | --- | --- |
@@ -203,8 +156,6 @@ customer features, and *k* is picked automatically by Silhouette, which gives **
 K-Means beats Agglomerative and DBSCAN on Silhouette (0.227 vs 0.207 / 0.217) and
 Calinski-Harabasz. Churn was not used to build the segments; it is only used here to
 describe them.
-
-**Segment interpretation**
 
 - **Low risk: phone-only customers** (22%). None have internet, so they average 1.2
   services and pay about 21/month. Two-thirds are on a one- or two-year contract, and few
@@ -227,29 +178,95 @@ describe them.
   2-year contract, switch them to automatic payment, bundle tech support and security
   during onboarding, and review fiber pricing.
 
-Each model's best configuration (chosen by cross-validated F1) evaluated on the held-out
-test set. Confusion matrices and ROC curves are in
-`reports/classification/test_comparison.png`:
+### 3. Classification and class imbalance
+
+Five models x four imbalance strategies, 5-fold CV on the training set
+(`reports/classification/model_comparison.csv`):
+
+| Model | Best strategy | CV recall without rebalancing | CV recall with it | CV F1 |
+| --- | --- | --- | --- | --- |
+| Random Forest | class_weight | 0.51 | 0.76 | 0.634 |
+| XGBoost | Random Oversampling | 0.53 | 0.76 | 0.627 |
+| Logistic Regression | SMOTE | 0.53 | 0.79 | 0.627 |
+| SVM | class_weight | 0.48 | 0.79 | 0.626 |
+| Decision Tree | class_weight | 0.48 | 0.81 | 0.612 |
+
+Without rebalancing, about half of the churners are missed. Every strategy raises recall
+(to 0.61-0.81, with SMOTE helping the tree ensembles least) and improves F1; ROC-AUC barely
+moves, because rebalancing shifts the decision
+threshold rather than ranking customers better. **Rebalancing matters more than the choice
+of model.**
+
+### 4. Cluster as a feature
+
+Each model, with its best strategy, on four feature sets (CV F1,
+`feature_set_comparison.csv`):
+
+| Model | Raw | Raw + cluster | Raw + FE | Raw + FE + cluster |
+| --- | --- | --- | --- | --- |
+| Random Forest | **0.637** | 0.633 | 0.634 | 0.633 |
+| Logistic Regression | 0.630 | **0.633** | 0.627 | 0.626 |
+| XGBoost | 0.632 | **0.632** | 0.627 | 0.632 |
+| SVM | 0.624 | 0.624 | 0.626 | **0.626** |
+| Decision Tree | 0.612 | 0.612 | 0.612 | **0.615** |
+
+All differences are within ±0.005 F1, i.e. within fold-to-fold noise. The cluster and the
+engineered features summarize information the models already get from contract, internet
+type, tenure and charges. **The cluster adds interpretability, not predictive power.**
+
+### 5. Optimization
+
+Each model's best configuration is tuned on CV F1: `GridSearchCV` for Logistic Regression,
+Decision Tree and SVM (small search spaces), `RandomizedSearchCV` (20 samples) for Random
+Forest and XGBoost (`optimisation.csv`, `optimisation.png`):
+
+| Model | Search | CV F1 before | CV F1 after | Best parameters |
+| --- | --- | --- | --- | --- |
+| Random Forest | random | 0.637 | **0.639** | 370 trees, max_depth 19, min_samples_leaf 16, max_features 0.28 |
+| XGBoost | random | 0.632 | 0.637 | 317 trees, max_depth 3, learning_rate 0.019, subsample 0.78 |
+| Logistic Regression | grid | 0.633 | 0.635 | C = 3 |
+| SVM | grid | 0.626 | 0.626 | C = 1, gamma = scale (the defaults) |
+| Decision Tree | grid | 0.615 | 0.625 | max_depth 5, min_samples_leaf 50 |
+
+Tuning helps the Decision Tree most (shallower tree, less overfitting) and brings small
+gains elsewhere.
+
+### 6. Final model
+
+The tuned models on the held-out test set (`test_comparison.csv`; confusion matrices and ROC
+curves in `test_comparison.png`):
 
 | Model | Imbalance | Features | Precision | Recall | F1 | ROC-AUC |
 | --- | --- | --- | --- | --- | --- | --- |
-| Random Forest | class_weight | raw | 0.540 | 0.745 | **0.626** | 0.839 |
-| Logistic Regression | smote | raw + cluster | 0.513 | 0.758 | 0.612 | **0.840** |
-| XGBoost | class_weight | raw + cluster | 0.519 | 0.755 | 0.615 | 0.836 |
-| SVM | class_weight | raw + FE + cluster | 0.611 | 0.616 | 0.613 | 0.827 |
-| Decision Tree | class_weight | raw + FE + cluster | 0.496 | **0.788** | 0.609 | 0.827 |
+| **Random Forest** | class_weight | raw | 0.525 | **0.782** | **0.629** | 0.842 |
+| XGBoost | Random Oversampling | raw + cluster | 0.516 | 0.774 | 0.619 | **0.843** |
+| Logistic Regression | SMOTE | raw + cluster | 0.513 | 0.761 | 0.613 | 0.839 |
+| SVM | class_weight | raw + FE + cluster | **0.611** | 0.616 | 0.613 | 0.827 |
+| Decision Tree | class_weight | raw + FE + cluster | 0.512 | 0.753 | 0.609 | 0.827 |
+
+The final model is the one with the best CV F1: the **tuned Random Forest with
+`class_weight`** on the raw features. On the test set it reaches **recall 0.78, precision
+0.53, F1 0.63, ROC-AUC 0.84**: it catches about 4 out of 5 churners, with roughly one false
+alarm per churner caught, which is acceptable for a retention campaign.
 
 SVM's test recall is lower than its CV recall (0.79) because the test metrics use
 `predict_proba >= 0.5`, and SVM's probability calibration partly undoes the class weighting.
 
-The conclusions match the notebooks:
-- Rebalancing matters more than the choice of model.
-- Neither feature engineering nor the cluster improves cross-validated F1 (0.625-0.626 for
-  every feature set).
-- The final model is a tuned Random Forest with `class_weight`: test **recall 0.78,
-  precision 0.53, F1 0.63, ROC-AUC 0.84**.
+## MLflow
 
-Figures and tables are written to `reports/` (`eda/`, `clustering/`, `classification/`).
+Two experiments, stored in `mlflow.db` / `mlruns/`:
+
+- **`tele-cluster-segmentation`**: one run per clustering algorithm, with its parameters,
+  the three cluster metrics, the elbow/silhouette and PCA figures, the segment profiles and
+  the fitted pipeline.
+- **`tele-cluster-churn`**: one run per configuration (model x strategy, model x feature
+  set) and per tuned model. Each run logs the model hyperparameters, the preprocessing
+  parameters (feature engineering, cluster feature, imputation, outlier clipping, scaling,
+  encoding), the imbalance strategy, the CV and test metrics, and the fitted pipeline.
+  The final run also holds the test comparison, the before/after tuning figure and the
+  classification report.
+
+The final model is registered in the Model Registry as **`tele-cluster-churn-app`**.
 
 ## Streamlit app
 
@@ -259,4 +276,4 @@ Figures and tables are written to `reports/` (`eda/`, `clustering/`, `classifica
 - **the churn prediction** (will churn / will stay),
 - **the churn probability**.
 
-It uses the app models (`models/segmentation.joblib` and `models/churn.joblib`).
+It uses `models/segmentation.joblib` and `models/churn.joblib`.
